@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+: "${CONFIG:=$HOME/.config/prusa-cam/env}"
+
+if ! [[ -f $CONFIG ]]; then
+	echo "$CONFIG doesn't exist, quitting"
+	exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+: "${PRINTER_STATUS_URL:=api/v1/status}"
+: "${SNAPSHOT_DIR:=$(mktemp -d --suffix=-prusa-cam)}"
+: "${SNAPSHOT_FILENAME:=output.jpg}"
+: "${SNAPSHOT_URL:=https://webcam.connect.prusa3d.com/c/snapshot}"
+: "${DELAY_SECONDS:=10}"
+
+config_check() {
+	if [[ -z $PRINTER_NAME ]]; then
+		echo Config missing PRINTER_NAME
+		exit 1
+	elif [[ -z $PRINTER_IP ]]; then
+		echo Config missing PRINTER_IP
+		exit 1
+	elif [[ -z $PRINTER_API_KEY ]]; then
+		echo Config missing PRINTER_API_KEY
+		exit 1
+	elif [[ -z $CAMERA_NAME ]]; then
+		echo Config missing CAMERA_NAME
+		exit 1
+	elif [[ -z $FINGERPRINT ]]; then
+		echo Config missing FINGERPRINT
+		exit 1
+	elif [[ -z $TOKEN ]]; then
+		echo Config missing TOKEN
+		exit 1
+	fi
+}
+
+dependency_check() {
+	if ! command -v curl >/dev/null; then
+		echo OS missing curl... wtf
+		exit 1
+	elif ! command -v jq >/dev/null; then
+		echo OS missing jq
+		exit 1
+	elif ! command -v v4l2-ctl >/dev/null; then
+		echo OS missing v4l2-ctl
+		exit 1
+	elif ! command -v ffmpeg >/dev/null; then
+		echo OS missing ffmpeg
+		exit 1
+	fi
+}
+
+get_camera_device() {
+	CAMERA_DEVICE=$(v4l2-ctl --list-devices |
+		grep -A 1 "$CAMERA_NAME" |
+		tail -n 1 |
+		tr -d \\t)
+
+	if [[ -z $CAMERA_DEVICE ]]; then
+		echo "Could not get camera device"
+		exit 1
+	fi
+}
+
+quit() {
+	rm -r "$SNAPSHOT_DIR"
+	exit 1
+}
+
+trap quit SIGINT SIGTERM
+
+is_printer_online() {
+	if ping \
+		-c 1 \
+		"$PRINTER_IP" \
+		>/dev/null 2>&1; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+is_printer_active() {
+	PRINTER_STATE=$(curl \
+		-H "X-Api-Key: $PRINTER_API_KEY" \
+		-s \
+		"$PRINTER_IP/$PRINTER_STATUS_URL" |
+		jq -r .printer.state)
+
+	if [[ $PRINTER_STATE = 'PRINTING' ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+get_snapshot() {
+	if ffmpeg \
+		-loglevel quiet \
+		-stats \
+		-y \
+		-f v4l2 \
+		-i "$CAMERA_DEVICE" \
+		-f image2 \
+		-vframes 1 \
+		-pix_fmt yuyv422 \
+		"$SNAPSHOT_DIR/$SNAPSHOT_FILENAME" \
+		2>/dev/null; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+post_snapshot() {
+	if curl \
+		-X PUT \
+		-H "Accept: */*" \
+		-H "Content-Type: image/jpg" \
+		-H "Fingerprint: $FINGERPRINT" \
+		-H "Token: $TOKEN" \
+		--data-binary "@$SNAPSHOT_DIR/$SNAPSHOT_FILENAME" \
+		--no-progress-meter \
+		--compressed \
+		"$SNAPSHOT_URL"; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+main() {
+	while true; do
+		if is_printer_online; then
+			unset PRINTER_NOT_ONLINE_SHOWN
+
+			if [[ -z $PRINTER_ONLINE_SHOWN ]]; then
+				echo "$PRINTER_NAME online"
+				PRINTER_ONLINE_SHOWN=1
+			fi
+
+			if is_printer_active; then
+				unset PRINTER_NOT_ACTIVE_SHOWN
+
+				if [[ -z $PRINTER_ACTIVE_SHOWN ]]; then
+					echo "$PRINTER_NAME active"
+					PRINTER_ACTIVE_SHOWN=1
+				fi
+
+				if get_snapshot; then
+					unset FFMPEG_FAILURE_SHOWN
+
+					if [[ -z $FFMPEG_SUCCESS_SHOWN ]]; then
+						echo "Successfully capturing snapshots"
+						FFMPEG_SUCCESS_SHOWN=1
+					fi
+
+					if post_snapshot; then
+						unset CLOUD_CONNECT_FAILURE_SHOWN
+
+						if [[ -z $CLOUD_CONNECT_SUCCESS_SHOWN ]]; then
+							echo "Successfully POSTing to Prusa Connect"
+							CLOUD_CONNECT_SUCCESS_SHOWN=1
+						fi
+					else
+						unset CLOUD_CONNECT_SUCCESS_SHOWN
+
+						if [[ -z $CLOUD_CONNECT_FAILURE_SHOWN ]]; then
+							echo "POSTing to Prusa Connect returned an error"
+							CLOUD_CONNECT_FAILURE_SHOWN=1
+						fi
+					fi
+				else
+					unset FFMPEG_SUCCESS_SHOWN
+
+					if [[ -z $FFMPEG_FAILURE_SHOWN ]]; then
+						echo "FFmpeg returned an error"
+						FFMPEG_FAILURE_SHOWN=1
+					fi
+
+					unset CLOUD_CONNECT_SUCCESS_SHOWN
+					unset CLOUD_CONNECT_FAILURE_SHOWN
+				fi
+			else
+				unset PRINTER_ACTIVE_SHOWN
+
+				if [[ -z $PRINTER_NOT_ACTIVE_SHOWN ]]; then
+					echo "$PRINTER_NAME not active"
+					PRINTER_NOT_ACTIVE_SHOWN=1
+				fi
+
+				unset FFMPEG_SUCCESS_SHOWN
+				unset FFMPEG_FAILURE_SHOWN
+
+				unset CLOUD_CONNECT_SUCCESS_SHOWN
+				unset CLOUD_CONNECT_FAILURE_SHOWN
+			fi
+		else
+			unset PRINTER_ONLINE_SHOWN
+
+			if [[ -z $PRINTER_NOT_ONLINE_SHOWN ]]; then
+				echo "$PRINTER_NAME offline"
+				PRINTER_NOT_ONLINE_SHOWN=1
+			fi
+
+			unset PRINTER_ACTIVE_SHOWN
+			unset PRINTER_NOT_ACTIVE_SHOWN
+
+			unset FFMPEG_SUCCESS_SHOWN
+			unset FFMPEG_FAILURE_SHOWN
+
+			unset CLOUD_CONNECT_SUCCESS_SHOWN
+			unset CLOUD_CONNECT_FAILURE_SHOWN
+		fi
+
+		sleep "$DELAY_SECONDS"
+	done
+}
+
+config_check
+
+dependency_check
+
+get_camera_device
+
+main

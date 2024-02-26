@@ -1,0 +1,11 @@
+[Unit]
+Description=Prusa Cam
+After=network-online.target
+
+[Service]
+ExecStart=/home/user/.local/bin/prusa-cam
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
